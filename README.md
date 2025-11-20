@@ -24,14 +24,14 @@
 
 ### 1\. Conda 환경 생성 및 활성화
 
-프로젝트를 위한 `sftdepth`라는 이름의 Conda 가상 환경을 생성하고 활성화합니다.
+프로젝트를 위한 `stfdepth`라는 이름의 Conda 가상 환경을 생성하고 활성화합니다.
 
 ```bash
-# 1. 'sftdepth'라는 이름으로 Python 3.10 환경 생성
-conda create -n sftdepth python=3.10
+# 1. 'stfdepth'라는 이름으로 Python 3.10 환경 생성
+conda create -n stfdepth python=3.10
 
 # 2. 생성한 환경 활성화
-conda activate sftdepth
+conda activate stfdepth
 ```
 
 ### 2\. 필수 라이브러리 설치
@@ -52,7 +52,7 @@ pip install transformers opencv-python rich matplotlib tqdm timm
 
 ```yaml
 # environment.yml
-name: sftdepth
+name: stfdepth
 channels:
   - pytorch
   - nvidia
