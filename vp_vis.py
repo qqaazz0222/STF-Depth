@@ -3,9 +3,9 @@ import pickle
 import numpy as np
 import PIL.Image as Image
 
-infer_result_path = '/workexternal/hyunsu/SFTDepth/STF-Depth/data/working/demo1/infer_result.pkl'
+infer_result_path = '/workexternal/hyunsu/SFTDepth/STF-Depth/data/working/vp_test/images_batch/infer_result.pkl'
 
-frame_idx = 1
+frame_idx = 0
 step_n = 5
 
 with open(infer_result_path, 'rb') as f:
@@ -28,8 +28,16 @@ depth_img.save(f'target_depth_map_frame_{frame_idx}.png')
 print(f'Saved target depth map as grayscale image')
 
 print('min depth:', np.min(target_depth_map), 'max depth:', np.max(target_depth_map))
-step = (np.max(target_depth_map) - np.min(target_depth_map)) / step_n
-step_values = [np.min(target_depth_map) + step * i for i in range(step_n + 1)]
+# Create variable step sizes that get smaller as we approach maximum depth
+# Using exponential distribution for finer granularity near maximum
+depth_min_val = np.min(target_depth_map)
+depth_max_val = np.max(target_depth_map)
+depth_range = depth_max_val - depth_min_val
+
+# Generate step values with exponential spacing (denser near maximum)
+# Using powers to create non-uniform distribution
+ratios = np.linspace(0, 1, step_n + 1) ** 2  # Square for exponential curve
+step_values = [depth_min_val + depth_range * ratio for ratio in ratios]
 
 center_points = []
 
@@ -77,7 +85,7 @@ for i in range(step_n):
         print('No valid values in this depth range')
 
     img = Image.fromarray(rgba_image, mode='RGBA')
-    img.save(f'depth_range_{i+1}_{depth_min:.2f}_{depth_max:.2f}.png')
+    img.save(f'depth_range_{i+1}.png')
     print(f'Saved depth range image for range {depth_min:.2f} to {depth_max:.2f}')
     
 depthest_point = np.unravel_index(np.argmin(target_depth_map), target_depth_map.shape)

@@ -160,8 +160,17 @@ cython_debug/
 .vscode/
 
 data/input/*.mp4
+data/input/paper
+data/input/paper_image
+data/input/dgu
+data/input/vp_test
 data/input_temp
 data/working
 data/output
 
 test
+vis
+temp.py
+vis.py
+vp_vis.py
+/*.png

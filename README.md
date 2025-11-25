@@ -88,7 +88,7 @@ conda env create -f environment.yml
 
     ```bash
     # Conda 환경 활성화
-    conda activate sftdepth
+    conda activate stfdepth
 
     # 스크립트 실행
     python run.py

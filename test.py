@@ -1,6 +1,7 @@
 # 
 
 import os
+import csv
 import time
 import rich
 import pickle
@@ -22,6 +23,7 @@ import torchvision.transforms as T
 from transformers import AutoProcessor, AutoModelForUniversalSegmentation
 from sklearn.linear_model import RANSACRegressor
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers.models.oneformer.image_processing_oneformer").setLevel(logging.ERROR)
 
@@ -150,12 +152,23 @@ def load_data(args, dataset_name):
     video_ext_list = ['.mp4', '.avi', '.mov']
     
     dataset = []
+    
+    # 이미지 파일들을 하나의 배치로 묶기
     image_list = [os.path.join(input_dir, fname) for fname in os.listdir(input_dir) if fname.lower().endswith(tuple(image_ext_list))]
     image_list.sort()
-    for image_path in tqdm(image_list, desc=" - Loading images"):
-        image_name = os.path.splitext(os.path.basename(image_path))[0]
-        dataset.append({'name': image_name, 'path': image_path, 'frames': [image_path]})
     
+    if len(image_list) > 0:
+        # 모든 이미지를 하나의 데이터로 묶어서 처리
+        image_names = [os.path.splitext(os.path.basename(img_path))[0] for img_path in image_list]
+        dataset.append({
+            'name': 'images_batch',  # 전체 이미지 배치의 이름
+            'path': input_dir,
+            'frames': image_list,
+            'frame_names': image_names,  # 각 이미지의 원본 이름 저장
+            'type': 'images'
+        })
+    
+    # 비디오 파일들은 개별적으로 처리
     video_list = [os.path.join(input_dir, fname) for fname in os.listdir(input_dir) if fname.lower().endswith(tuple(video_ext_list))]
     video_list.sort()
     for video_path in tqdm(video_list, desc=" - Loading videos"):
@@ -165,10 +178,54 @@ def load_data(args, dataset_name):
         os.makedirs(cur_video_working_dir, exist_ok=True)
         os.makedirs(cur_video_frame_dir, exist_ok=True)
         frame_list = extract_video_to_frames(video_path, cur_video_frame_dir)
-        dataset.append({'name': video_name, 'path': video_path, 'frames': frame_list})
+        dataset.append({'name': video_name, 'path': video_path, 'frames': frame_list, 'type': 'video'})
         
     return dataset
 
+
+@print_task
+def load_calc_data(args, dataset_name, stage_name='smoothed'):
+    """계산용 데이터 로드 함수"""
+    dataset = []
+    t_flag, f_flag = 0, 0
+    
+    pred_dir = os.path.join(args.output_dir, dataset_name)
+    if stage_name is not None:
+        stage_dir = os.path.join(pred_dir, 'stages', stage_name)
+        if os.path.exists(stage_dir):
+            pred_dir = stage_dir
+        else:
+            print(f" - Stage '{stage_name}' outputs not found for {dataset_name}. Skipping load.")
+            return []
+
+    pred_file_list = []
+    for root, _, files in os.walk(pred_dir):
+        if 'depth_map.npy' in files:
+            pred_file_list.append(os.path.join(root, 'depth_map.npy'))
+    pred_file_list.sort()
+    print(f" - Prediction files loaded: {len(pred_file_list)} files found.")
+    
+    gt_dir = os.path.join(args.input_dir, dataset_name, "gt")
+    gt_file_list = [os.path.join(gt_dir, f) for f in os.listdir(gt_dir) if f.lower().endswith('.npy')]
+    gt_file_list.sort()
+    print(f" - Ground Truth files loaded: {len(gt_file_list)} files found.")
+    
+    for pred, gt in zip(pred_file_list, gt_file_list):
+        flag = os.path.basename(gt).split('.')[0] in pred
+        if flag:
+            t_flag += 1
+            dataset.append({
+                'pred_path': pred, 
+                'pred': np.load(pred),
+                'gt_path': gt,
+                'gt': np.load(gt)
+            })
+        else:
+            f_flag += 1
+    
+    print(f" - Pred-GT matching results: Matched: {t_flag}, Unmatched: {f_flag}")
+    
+    return dataset
 
 def infer_depth(model, processor, image, device):
     """깊이 추정 함수"""
@@ -237,7 +294,7 @@ def infer_segment_detail(model, processor, image, device):
 def draw_depth_map(path, depth_map):
     """깊이 맵 시각화 함수 (최적화)"""
     normalized_map = (depth_map - np.min(depth_map)) / (np.max(depth_map) - np.min(depth_map))
-    colored_map = (plt.cm.viridis_r(normalized_map)[:, :, :3] * 255).astype(np.uint8)
+    colored_map = (plt.cm.magma_r(normalized_map)[:, :, :3] * 255).astype(np.uint8)
     if path is not None:
         Image.fromarray(colored_map).save(path)
     return colored_map
@@ -275,6 +332,25 @@ def draw_panoptic_map(path, image, panoptic_map, segments_info):
     return blended_image
 
 
+def save_stage_outputs(dataset_output_dir, video_name, stage_name, depth_map_list, data_type, frame_names=None):
+    """단계별 평가를 위한 중간 결과 저장"""
+    if depth_map_list is None or len(depth_map_list) == 0:
+        return
+    stage_video_dir = os.path.join(dataset_output_dir, "stages", stage_name, video_name)
+    os.makedirs(stage_video_dir, exist_ok=True)
+
+    if data_type == 'video':
+        depth_stack = np.array(depth_map_list, dtype=np.float32)
+        np.save(os.path.join(stage_video_dir, "depth_map.npy"), depth_stack)
+    else:
+        if frame_names is None:
+            frame_names = [f"{idx:08d}" for idx in range(len(depth_map_list))]
+        for depth_map, frame_name in zip(depth_map_list, frame_names):
+            frame_dir = os.path.join(stage_video_dir, frame_name)
+            os.makedirs(frame_dir, exist_ok=True)
+            np.save(os.path.join(frame_dir, "depth_map.npy"), depth_map)
+
+
 @print_task
 def visualize_results(working_dir, frame_list, depth_map_list, segment_map_list, segment_detail_map_list, segment_detail_info_list):
     """결과 시각화 함수"""
@@ -290,13 +366,13 @@ def visualize_results(working_dir, frame_list, depth_map_list, segment_map_list,
         depth_map_path = os.path.join(depth_map_dir, f"{idx:08d}.png")
         draw_depth_map(depth_map_path, depth_map)
 
-    for idx, (image, segment_map) in tqdm(enumerate(zip(frame_list, segment_map_list)), desc=f" - Visualizing segment map", total=len(frame_list)):
-        segment_map_path = os.path.join(segment_map_dir, f"{idx:08d}.png")
-        draw_segment_map(segment_map_path, image, segment_map)
+    # for idx, (image, segment_map) in tqdm(enumerate(zip(frame_list, segment_map_list)), desc=f" - Visualizing segment map", total=len(frame_list)):
+    #     segment_map_path = os.path.join(segment_map_dir, f"{idx:08d}.png")
+    #     draw_segment_map(segment_map_path, image, segment_map)
         
-    for idx, (image, segment_detail_map, segments_info) in tqdm(enumerate(zip(frame_list, segment_detail_map_list, segment_detail_info_list)), desc=f" - Visualizing segment detail map", total=len(frame_list)):
-        segment_detail_map_path = os.path.join(segment_detail_map_dir, f"{idx:08d}.png")
-        draw_panoptic_map(segment_detail_map_path, image, segment_detail_map, segments_info)
+    # for idx, (image, segment_detail_map, segments_info) in tqdm(enumerate(zip(frame_list, segment_detail_map_list, segment_detail_info_list)), desc=f" - Visualizing segment detail map", total=len(frame_list)):
+    #     segment_detail_map_path = os.path.join(segment_detail_map_dir, f"{idx:08d}.png")
+    #     draw_panoptic_map(segment_detail_map_path, image, segment_detail_map, segments_info)
     
     return None
 
@@ -668,25 +744,51 @@ def temporal_smooth(video_working_dir, enhanced_depth_map_list, lambda_val=0.5, 
 
 
 @print_task
-def save(output_dir, smoothed_depth_map_list):
+def save(output_dir, smoothed_depth_map_list, data_type='video', frame_names=None):
     """결과물을 영상과 파일로 저장하는 함수"""
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video_height, video_width = smoothed_depth_map_list[0].shape
-    video_output = cv2.VideoWriter(os.path.join(output_dir, "depth_video.mp4"), fourcc, 30, (video_width, video_height))
+    if data_type == 'video' and len(smoothed_depth_map_list) > 2:
+        # 비디오로 저장
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_height, video_width = smoothed_depth_map_list[0].shape
+        video_output = cv2.VideoWriter(os.path.join(output_dir, "depth_video.mp4"), fourcc, 30, (video_width, video_height))
 
-    for depth_map in tqdm(smoothed_depth_map_list, desc=" - Saving depth video", total=len(smoothed_depth_map_list)):
-        # 깊이 맵을 컬러 맵으로 변환
-        color_depth_map = draw_depth_map(None, depth_map)
-        video_output.write(color_depth_map)
+        for depth_map in tqdm(smoothed_depth_map_list, desc=" - Saving depth video", total=len(smoothed_depth_map_list)):
+            # 깊이 맵을 컬러 맵으로 변환
+            color_depth_map = draw_depth_map(None, depth_map)
+            video_output.write(color_depth_map)
 
-    video_output.release()
-    
-    depth_map_numpy = np.array(smoothed_depth_map_list)
-    depth_map_path = os.path.join(output_dir, "depth_map.npy")
-    np.save(depth_map_path, depth_map_numpy)
+        video_output.release()
+        
+        # npy 파일로 저장
+        depth_map_numpy = np.array(smoothed_depth_map_list)
+        depth_map_path = os.path.join(output_dir, "depth_map.npy")
+        np.save(depth_map_path, depth_map_numpy)
+        
+    elif data_type == 'images':
+        # 이미지 배치인 경우: 각 이미지별로 개별 디렉토리에 저장
+        for idx, (depth_map, frame_name) in enumerate(tqdm(zip(smoothed_depth_map_list, frame_names), desc=" - Saving individual images", total=len(smoothed_depth_map_list))):
+            frame_output_dir = os.path.join(output_dir, frame_name)
+            os.makedirs(frame_output_dir, exist_ok=True)
+            
+            # PNG 이미지로 저장
+            depth_map_png_path = os.path.join(frame_output_dir, "depth_map.png")
+            draw_depth_map(depth_map_png_path, depth_map)
+            
+            # NPY 파일로 저장 (단일 프레임)
+            depth_map_npy_path = os.path.join(frame_output_dir, "depth_map.npy")
+            np.save(depth_map_npy_path, depth_map)
+    else:
+        # 단일 이미지인 경우
+        depth_map = smoothed_depth_map_list[0]
+        depth_map_path = os.path.join(output_dir, "depth_map.png")
+        draw_depth_map(depth_map_path, depth_map)
+        
+        depth_map_numpy = np.array(smoothed_depth_map_list)
+        depth_map_path = os.path.join(output_dir, "depth_map.npy")
+        np.save(depth_map_path, depth_map_numpy)
+        
 
-
-def main(args):
+def test(args):
     # 모델 및 프로세서 초기화
     depth_model, segment_model, segment_detail_model, device = init_model(args)
     depth_processor, segment_processor, segment_detail_processor = init_processor(args)
@@ -705,9 +807,11 @@ def main(args):
         # 영상별 처리
         for video_data in dataset:
             video_name = video_data['name']
+            data_type = video_data.get('type', 'video')
             if video_name in []:
                 continue
             frames = video_data['frames']
+            frame_names = video_data.get('frame_names', None)
             video_working_dir = os.path.join(dataset_working_dir, video_name)
             video_output_dir = os.path.join(dataset_output_dir, video_name)
             os.makedirs(video_working_dir, exist_ok=True)
@@ -758,9 +862,13 @@ def main(args):
                 with open(os.path.join(video_working_dir, args.infer_result), "wb") as f:
                     pickle.dump(infer_result, f)
 
+            save_stage_outputs(dataset_output_dir, video_name, 'raw', depth_map_list, data_type, frame_names)
+
             # 시각화
             if args.visualize:
                 visualize_results(video_working_dir, frame_list, depth_map_list, segment_map_list, segment_detail_map_list, segment_detail_info_list)
+                
+            # method a) 원본 깊이 맵 npy 저장
             
             # 소실점 추정
             vanishing_point_list = estimate_vanishing_point(depth_map_list, num_layers=args.num_layer)
@@ -778,6 +886,9 @@ def main(args):
                 }
                 with open(os.path.join(video_working_dir, args.separated_result), "wb") as f:
                     pickle.dump(separated_result, f)
+                    
+            # method b) 분리 처리된 깊이 맵 npy 저장
+            save_stage_outputs(dataset_output_dir, video_name, 'separated', separated_depth_map_list, data_type, frame_names)
             
             # 향상 처리
             if os.path.exists(os.path.join(video_working_dir, args.enhanced_result)):
@@ -792,25 +903,203 @@ def main(args):
                 }
                 with open(os.path.join(video_working_dir, args.enhanced_result), "wb") as f:
                     pickle.dump(enhanced_result, f)
+                    
+            # method c) 향상 처리된 깊이 맵 npy 저장
+            save_stage_outputs(dataset_output_dir, video_name, 'enhanced', enhanced_depth_map_list, data_type, frame_names)
             
-            # 시간적 일관성 처리
-            if os.path.exists(os.path.join(video_working_dir, args.smoothed_result)):
-                rich.print(f"[bold yellow][!] Smoothed results for {video_name} already exist. Skipping...[/bold yellow]")
-                with open(os.path.join(video_working_dir, args.smoothed_result), "rb") as f:
-                    smoothed_result = pickle.load(f)
-                smoothed_depth_map_list = smoothed_result['smoothed_depth_map']
+            # 시간적 일관성 처리 (비디오인 경우만)
+            if data_type == 'video':
+                if os.path.exists(os.path.join(video_working_dir, args.smoothed_result)):
+                    rich.print(f"[bold yellow][!] Smoothed results for {video_name} already exist. Skipping...[/bold yellow]")
+                    with open(os.path.join(video_working_dir, args.smoothed_result), "rb") as f:
+                        smoothed_result = pickle.load(f)
+                    smoothed_depth_map_list = smoothed_result['smoothed_depth_map']
+                else:
+                    smoothed_depth_map_list = temporal_smooth(video_working_dir, enhanced_depth_map_list, lambda_val=0.1, num_iterations=2)
+                    smoothed_result = {
+                        'smoothed_depth_map': smoothed_depth_map_list
+                    }
+                    with open(os.path.join(video_working_dir, args.smoothed_result), "wb") as f:
+                        pickle.dump(smoothed_result, f)
             else:
-                smoothed_depth_map_list = temporal_smooth(video_working_dir, enhanced_depth_map_list, lambda_val=0.1, num_iterations=2)
-                smoothed_result = {
-                    'smoothed_depth_map': smoothed_depth_map_list
-                }
-                with open(os.path.join(video_working_dir, args.smoothed_result), "wb") as f:
-                    pickle.dump(smoothed_result, f)
+                # 이미지 배치인 경우 시간적 스무딩 건너뛰기
+                rich.print(f"[bold yellow][!] Skipping temporal smoothing for images batch {video_name}[/bold yellow]")
+                smoothed_depth_map_list = enhanced_depth_map_list
+                
+            # method d) 시간적 일관성 처리된 깊이 맵 npy 저장
+            save_stage_outputs(dataset_output_dir, video_name, 'smoothed', smoothed_depth_map_list, data_type, frame_names)
             
             # 결과 저장
-            save(video_output_dir, smoothed_depth_map_list)
+            save(video_output_dir, smoothed_depth_map_list, data_type=data_type, frame_names=frame_names)
             rich.print(f"[bold green][*] Results for {video_name} saved to {video_output_dir}[/bold green]\n")
+            
+def preprocess_depth_map(dataset, dataset_name):
+    """깊이 맵 전처리 함수"""
+    for idx, data in tqdm(enumerate(dataset), desc=" - Preprocessing", total=len(dataset)):
+        pred = data['pred'].astype(np.float64, copy=True)
+        gt = data['gt'].astype(np.float64, copy=True)
+
+        # Dataset-specific GT normalization
+        if dataset_name == 'nyu':
+            gt = gt / 1000.0  # millimeter -> meter
+            gt_min_clip, gt_max_clip = 0.5, 10.0
+        elif dataset_name == 'kitti':
+            gt = gt / 256.0  # KITTI depth PNG scale -> meter
+            gt_min_clip, gt_max_clip = 1.0, 80.0
+        else:
+            gt_min_clip, gt_max_clip = 0.0, np.inf
+
+        # Clamp GT to evaluation range and mask invalid pixels
+        gt_valid_mask = np.isfinite(gt) & (gt > 0)
+        range_mask = (gt >= gt_min_clip) & (gt <= gt_max_clip)
+        gt_valid_mask &= range_mask
+        gt = np.clip(gt, gt_min_clip, gt_max_clip)
+        gt[~gt_valid_mask] = np.nan
+
+        # Prepare valid pixel pairs
+        pred_flat = pred.flatten()
+        gt_flat = gt.flatten()
+        valid_mask = np.isfinite(pred_flat) & np.isfinite(gt_flat) & (gt_flat > 0)
+
+        if np.count_nonzero(valid_mask) < 50:
+            dataset[idx]['pred'] = np.full_like(pred, np.nan)
+            dataset[idx]['gt'] = gt
+            continue
+
+        pred_valid = pred_flat[valid_mask]
+        gt_valid = gt_flat[valid_mask]
+
+        # Solve for optimal scale & shift (least squares) as in SOTA monocular depth eval
+        A = np.vstack([pred_valid, np.ones_like(pred_valid)]).T
+        try:
+            scale, shift = np.linalg.lstsq(A, gt_valid, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            scale, shift = 1.0, 0.0
+
+        pred_aligned = scale * pred + shift
+        pred_aligned = np.clip(pred_aligned, gt_min_clip, gt_max_clip)
+
+        # Keep invalid regions as NaN so they are ignored later
+        pred_result = np.full_like(pred_aligned, np.nan)
+        pred_result_flat = pred_result.flatten()
+        pred_aligned_flat = pred_aligned.flatten()
+        pred_result_flat[valid_mask] = pred_aligned_flat[valid_mask]
+        pred_result = pred_result_flat.reshape(pred.shape)
+
+        dataset[idx]['pred'] = pred_result
+        dataset[idx]['gt'] = gt
+            
+    return dataset
+
+
+def _extract_valid_pairs(pred, gt, require_positive_pred=False):
+    """평가에 사용할 유효한 (pred, gt) 쌍 추출"""
+    pred = np.asarray(pred, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.float64)
+    valid_mask = np.isfinite(pred) & np.isfinite(gt) & (gt > 0)
+    if require_positive_pred:
+        valid_mask &= (pred > 0)
+    pred_valid = pred[valid_mask]
+    gt_valid = gt[valid_mask]
+    return pred_valid, gt_valid
+
+def calculate_absral(pred, gt):
+    """AbsRel 계산 함수 (NaN 값 제외)"""
+    pred_valid, gt_valid = _extract_valid_pairs(pred, gt)
+    if len(pred_valid) == 0:
+        return float('nan')
+    return np.mean(np.abs(gt_valid - pred_valid) / gt_valid)
+
+def calculate_sqrel(pred, gt):
+    """SqRel 계산 함수 (NaN 값 제외)"""
+    pred_valid, gt_valid = _extract_valid_pairs(pred, gt)
+    if len(pred_valid) == 0:
+        return float('nan')
+    return np.mean(((gt_valid - pred_valid) ** 2) / gt_valid)
+
+def calculate_rmselog(pred, gt):
+    """RMSLog 계산 함수 (NaN 값 제외)"""
+    pred_valid, gt_valid = _extract_valid_pairs(pred, gt, require_positive_pred=True)
+    if len(pred_valid) == 0:
+        return float('nan')
+    eps = 1e-6
+    log_diff = np.log(np.clip(pred_valid, eps, None)) - np.log(np.clip(gt_valid, eps, None))
+    return np.sqrt(np.mean(log_diff ** 2))
+
+def calculate_delta(pred, gt, threshold=1.25):
+    """Delta accuracy 계산 함수 (NaN 값 제외)"""
+    pred_valid, gt_valid = _extract_valid_pairs(pred, gt, require_positive_pred=True)
+    if len(pred_valid) == 0:
+        return float('nan')
+    ratio = np.maximum(pred_valid / gt_valid, gt_valid / pred_valid)
+    return np.mean(ratio < threshold)
+            
+def calculate(args):
+    dataset_list = args.datasets
+    stage_list = ['raw', 'separated', 'enhanced', 'smoothed']
+    
+    for dataset_name in dataset_list:
+        for stage_name in stage_list:
+            dataset = load_calc_data(args, dataset_name, stage_name=stage_name)
+            if len(dataset) == 0:
+                continue
+            dataset = preprocess_depth_map(dataset, dataset_name)
+            result_path = os.path.join(args.output_dir, f"{dataset_name}_{stage_name}_calculation_results.csv")
+            
+            header = ["Index", "AbsRel", "SqRel", "RMSLog", "Delta1", "Delta2", "Delta3"]
+            with open(result_path, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(header)
+            
+            absrel_list = []
+            sqrel_list = []
+            rmselog_list = []
+            delta1_list = []
+            delta2_list = []
+            delta3_list = []
+            for idx, data in tqdm(enumerate(dataset), desc=f" - Calculating metrics for {dataset_name} ({stage_name})", total=len(dataset)):
+                pred = data['pred']
+                gt = data['gt']
+                
+                absrel = calculate_absral(pred, gt)
+                sqrel = calculate_sqrel(pred, gt)
+                rmselog = calculate_rmselog(pred, gt)
+                delta1 = calculate_delta(pred, gt, threshold=1.25)
+                delta2 = calculate_delta(pred, gt, threshold=1.25 ** 2)
+                delta3 = calculate_delta(pred, gt, threshold=1.25 ** 3)
+                with open(result_path, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([idx, absrel, sqrel, rmselog, delta1, delta2, delta3])
+                
+                absrel_list.append(absrel)
+                sqrel_list.append(sqrel)
+                rmselog_list.append(rmselog)
+                delta1_list.append(delta1)
+                delta2_list.append(delta2)
+                delta3_list.append(delta3)
+
+            def safe_mean(values):
+                values = np.array(values, dtype=np.float64)
+                return float(np.nanmean(values)) if np.any(np.isfinite(values)) else float('nan')
+
+            mean_absrel = safe_mean(absrel_list)
+            mean_sqrel = safe_mean(sqrel_list)
+            mean_rmselog = safe_mean(rmselog_list)
+            mean_delta1 = safe_mean(delta1_list)
+            mean_delta2 = safe_mean(delta2_list)
+            mean_delta3 = safe_mean(delta3_list)
+
+            with open(result_path, mode='a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(["mean", mean_absrel, mean_sqrel, mean_rmselog, mean_delta1, mean_delta2, mean_delta3])
+
+            rich.print(
+                f"[bold cyan]Dataset {dataset_name} ({stage_name}) mean metrics[/bold cyan] "
+                f"AbsRel: {mean_absrel:.4f}, SqRel: {mean_sqrel:.4f}, RMSLog: {mean_rmselog:.4f}, "
+                f"Delta1: {mean_delta1:.4f}, Delta2: {mean_delta2:.4f}, Delta3: {mean_delta3:.4f}"
+            )
 
 if __name__ == "__main__":
     args = init_args()
-    main(args)
+    test(args)
+    calculate(args)
